@@ -1,0 +1,93 @@
+name: Upstream watch
+
+# Checks daily for a new published Ashigaru Desktop release. When one appears
+# and its BIP47 release signature and hash chain verify, it opens a pull
+# request that bumps the Dockerfile pins and startos/versions/current.ts.
+# Nothing is released from here: a person rewrites the release notes, tests
+# the build on StartOS, merges and tags. See .github/scripts/upstream_bump.py.
+#
+# Pull requests opened with the default GITHUB_TOKEN do not start other
+# workflows, so Build only runs on its own when the UPSTREAM_BOT_TOKEN secret
+# holds a fine-grained token for this repository (Contents and Pull requests:
+# read and write). Without it, run Build on the branch by hand.
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.UPSTREAM_BOT_TOKEN || github.token }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install signature verification dependency
+        run: pip install coincurve==21.0.0
+
+      - name: Check upstream and verify the release
+        id: bump
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -I .github/scripts/upstream_bump.py --repo . --body "$RUNNER_TEMP/pr-body.md"
+
+      - name: Skip if a pull request branch already exists
+        id: branch
+        if: steps.bump.outputs.updated == 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          branch="upstream/v${VERSION}"
+          echo "name=${branch}" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --heads origin "${branch}" > /dev/null; then
+            echo "Branch ${branch} already exists; leaving it alone."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node.js
+        if: steps.branch.outputs.exists == 'false'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Format the edited version file
+        if: steps.branch.outputs.exists == 'false'
+        run: |
+          npm ci
+          npx prettier --config node_modules/@start9labs/start-sdk/prettier.config.json --write startos
+
+      - name: Open the pull request
+        if: steps.branch.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_BOT_TOKEN || github.token }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -b "${BRANCH}"
+          git add Dockerfile startos/versions/current.ts
+          git commit -m "Update Ashigaru Desktop to ${VERSION}"
+          git push origin "${BRANCH}"
+          gh pr create --base main --head "${BRANCH}" \
+            --title "Update Ashigaru Desktop to ${VERSION}" \
+            --body-file "$RUNNER_TEMP/pr-body.md"
